@@ -1,0 +1,8 @@
+# ----
+# Automatically Generated .dropboxignore file at Tue Apr 23 13:35:17 PDT 2024
+# ----
+/.vscode
+/.embuild
+/target
+/Cargo.lock
+# ----

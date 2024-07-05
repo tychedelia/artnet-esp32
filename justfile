@@ -1,6 +1,6 @@
 flash:
-    cargo build
-    espflash flash "target/xtensa-esp32-espidf/debug/artnet-esp32"
+    CRATE_CC_NO_DEFAULTS=1 cargo build --release
+    cargo espflash flash --release
 
 monitor:
-    espflash monitor
+    cargo espflash monitor

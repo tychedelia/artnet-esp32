@@ -1,7 +1,8 @@
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::Duration;
+use anyhow::Context;
 
-use artnet_protocol::{ArtCommand, Poll};
-use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver};
+use esp_idf_svc::eth::{BlockingEth, EspEth, EthDriver, RmiiEth};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio;
 use esp_idf_svc::hal::gpio::AnyOutputPin;
@@ -9,23 +10,19 @@ use esp_idf_svc::hal::prelude::*;
 use esp_idf_svc::hal::spi::{config, SPI2, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
 use esp_idf_svc::hal::spi::*;
 use esp_idf_svc::hal::units::*;
+use sacn::packet::ACN_SDT_MULTICAST_PORT;
+use sacn::receive::SacnReceiver;
+use smart_leds_trait::{RGB8, SmartLedsWrite};
+use ws2812_esp32_rmt_driver::Ws2812Esp32Rmt;
 
 fn main() -> anyhow::Result<()> {
-    // It is necessary to call this function once. Otherwise some patches to the runtime
-    // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
-    // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    log::info!("Hello, world!");
-
     let peripherals = Peripherals::take()?;
-
     let pins = peripherals.pins;
-
     let sys_loop = EspSystemEventLoop::take()?;
 
-    // Make sure to configure ethernet in sdkconfig and adjust the parameters below for your hardware
     let eth_driver = EthDriver::new(
         peripherals.mac,
         pins.gpio25,
@@ -43,66 +40,45 @@ fn main() -> anyhow::Result<()> {
         sys_loop.clone(),
     )?;
     let eth = EspEth::wrap(eth_driver)?;
-
-    let spi = peripherals.spi2; // HSPI
-    let sclk = pins.gpio14;
-    let serial_in = pins.gpio12; // SDI
-    let serial_out = pins.gpio13; // SDO
-    let cs = pins.gpio15;
-
-    log::info!("Starting SPI");
-
-    let driver = SpiDriver::new::<SPI2>(
-        spi,
-        sclk,
-        serial_out,
-        Some(serial_in),
-        &SpiDriverConfig::new(),
-    )?;
-    let config = config::Config::new().baudrate(KiloHertz::try_from(800)?.into());
-    let mut led_strip = SpiDeviceDriver::new(&driver, Some(cs), &config)?;
-
-    log::info!("Eth created");
-
     let mut eth = BlockingEth::wrap(eth, sys_loop.clone())?;
 
-    log::info!("Starting eth...");
+    let led_pin = pins.gpio14;
+    let channel = peripherals.rmt.channel0;
+    let mut ws2815 = Ws2812Esp32Rmt::new(channel, led_pin).unwrap();
+    let mut dmx_recv = setup_and_start(&mut eth)?;
 
+    loop {
+        let packet = dmx_recv.recv(Some(Duration::from_millis(16))).expect("Failed to receive packet");
+        for dmx in packet {
+            let pixels = dmx.values.chunks(3)
+                .take(115)
+                .map(|chunk| {
+                    let rgb = RGB8 {
+                        r: chunk[0],
+                        g: chunk[1],
+                        b: chunk[2],
+                    };
+                    rgb
+                });
+            ws2815.write(pixels)?;
+        }
+    }
+
+    Ok(())
+}
+
+
+fn setup_and_start(eth: &mut BlockingEth<EspEth<RmiiEth>>) -> anyhow::Result<SacnReceiver> {
     eth.start()?;
-
     log::info!("Waiting for DHCP lease...");
-
     eth.wait_netif_up()?;
 
     let ip_info = eth.eth().netif().get_ip_info()?;
 
     log::info!("Eth DHCP info: {:?}", ip_info);
 
-    let socket = UdpSocket::bind((ip_info.ip, 6454)).unwrap();
-    socket.set_broadcast(true).unwrap();
+    let mut dmx_recv = SacnReceiver::with_ip(SocketAddr::new(ip_info.ip.into(), ACN_SDT_MULTICAST_PORT), None).map_err(|e| anyhow::anyhow!("failed to create receiver"))?;
+    dmx_recv.listen_universes(&[1]).map_err(|e| anyhow::anyhow!("failed to listen to universes"))?;
 
-    log::info!("Bound port");
-
-    loop {
-        log::info!("Listen!");
-        let mut buffer = [0u8; 1024];
-        let (length, addr) = socket.recv_from(&mut buffer).unwrap();
-        let command = ArtCommand::from_buffer(&buffer[..length]).unwrap();
-
-        log::info!("Received {:?}", command);
-        match command {
-            ArtCommand::Poll(poll) => {
-
-            },
-            ArtCommand::PollReply(reply) => {
-
-            },
-            ArtCommand::Output(output) => {
-                led_strip.write(output.data.as_ref())?;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
+    Ok(dmx_recv)
 }
